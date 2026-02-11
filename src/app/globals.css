@@ -1,17 +1,19 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #0a0a0a;
+  --foreground: #ededed;
   
-  /* Design System Colors - Tambahkan warna sesuai kebutuhan dari Figma */
-  /* Contoh struktur warna yang bisa digunakan */
+  /* Design System Colors */
   --color-purple-500: #a855f7;
   --color-purple-600: #9333ea;
+  --color-pink-500: #ec4899;
   --color-gray-100: #f3f4f6;
   --color-gray-200: #e5e7eb;
+  --color-gray-400: #9ca3af;
   --color-gray-500: #6b7280;
   --color-gray-600: #4b5563;
+  --color-gray-700: #374151;
   --color-gray-900: #111827;
 }
 
@@ -20,21 +22,14 @@
   --color-foreground: var(--foreground);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
-  
-  /* Custom spacing dengan 1px ratio (1:1 bukan 1:4) */
-  /* p-1 = 1px, p-4 = 4px, p-16 = 16px */
-  /* Spacing sudah dikonfigurasi di tailwind.config.ts */
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
 }
