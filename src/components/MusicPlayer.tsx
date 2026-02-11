@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
   Play,
@@ -12,42 +12,312 @@ import {
   Volume2,
   Music2,
 } from "lucide-react";
+import type { Track } from "./Playlist";
+import { Slider } from "@/components/ui/slider";
 
 type PlayerState = "playing" | "paused" | "loading";
 
-export function MusicPlayer() {
-  const [playerState, setPlayerState] = useState<PlayerState>("paused");
-  const [progress, setProgress] = useState(23); // Current progress in seconds
-  const [volume, setVolume] = useState(70);
+interface MusicPlayerProps {
+  currentTrack: Track | null;
+  onNext?: () => void;
+  onPrevious?: () => void;
+}
 
-  const duration = 205; // Total duration in seconds (3:25)
+export function MusicPlayer({
+  currentTrack,
+  onNext,
+  onPrevious,
+}: MusicPlayerProps) {
+  const [playerState, setPlayerState] = useState<PlayerState>("paused");
+  const [progress, setProgress] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [volume, setVolume] = useState(70);
+  const [frequencyData, setFrequencyData] = useState<number[]>([0, 0, 0, 0, 0]);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
+  const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
 
   // Format time as MM:SS
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
+    const secs = Math.floor(seconds % 60);
     return `${mins}:${secs.toString().padStart(2, "0")}`;
   };
 
-  // Handle play/pause toggle with loading state
-  const handlePlayPause = () => {
-    if (playerState === "loading") return;
+  // Initialize audio element
+  useEffect(() => {
+    if (!audioRef.current) {
+      audioRef.current = new Audio();
+      audioRef.current.volume = volume / 100;
 
-    setPlayerState("loading");
-    setTimeout(() => {
-      setPlayerState(playerState === "playing" ? "paused" : "playing");
-    }, 500);
+      audioRef.current.addEventListener("loadedmetadata", () => {
+        setDuration(audioRef.current?.duration || 0);
+        setProgress(0);
+      });
+
+      audioRef.current.addEventListener("timeupdate", () => {
+        setProgress(audioRef.current?.currentTime || 0);
+      });
+
+      audioRef.current.addEventListener("ended", () => {
+        setPlayerState("paused");
+        if (onNext) onNext();
+      });
+    }
+
+    return () => {
+      audioRef.current?.pause();
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+      audioContextRef.current?.close();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Load new track
+  useEffect(() => {
+    if (currentTrack && audioRef.current) {
+      // Check if track has a URL (CDN) or file (local)
+      const audioUrl = currentTrack.url || URL.createObjectURL(currentTrack.file);
+      audioRef.current.src = audioUrl;
+      if (currentTrack.url) {
+        audioRef.current.crossOrigin = "anonymous";
+      }
+      audioRef.current.load();
+
+      // Auto-play when track is loaded
+      const handleCanPlay = () => {
+        // Initialize Web Audio API before playing
+        if (!audioContextRef.current) {
+          console.log("🔧 Initializing Web Audio API (auto-play)...");
+          initializeAudioContext();
+        }
+
+        // Resume AudioContext if suspended
+        if (audioContextRef.current?.state === "suspended") {
+          audioContextRef.current.resume().then(() => {
+            console.log("   AudioContext resumed, state:", audioContextRef.current?.state);
+          });
+        }
+
+        audioRef.current?.play().then(() => {
+          setPlayerState("playing");
+          startVisualization();
+          console.log("▶️ Auto-playing with visualization");
+        }).catch((error) => {
+          console.error("❌ Auto-play failed:", error);
+          setPlayerState("paused");
+        });
+      };
+
+      audioRef.current.addEventListener("canplay", handleCanPlay, { once: true });
+
+      return () => {
+        // Only revoke blob URLs, not CDN URLs
+        if (!currentTrack.url) {
+          URL.revokeObjectURL(audioUrl);
+        }
+        audioRef.current?.removeEventListener("canplay", handleCanPlay);
+      };
+    }
+  }, [currentTrack]);
+
+  // Update volume
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.volume = volume / 100;
+    }
+  }, [volume]);
+
+  // Initialize Web Audio API
+  const initializeAudioContext = () => {
+    if (!audioRef.current || audioContextRef.current) return;
+
+    try {
+      const AudioContextClass = window.AudioContext || (window as typeof window & { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      audioContextRef.current = new AudioContextClass();
+      analyserRef.current = audioContextRef.current.createAnalyser();
+      analyserRef.current.fftSize = 1024;
+      analyserRef.current.smoothingTimeConstant = 0.3;
+      analyserRef.current.minDecibels = -85;
+      analyserRef.current.maxDecibels = -25;
+
+      sourceNodeRef.current = audioContextRef.current.createMediaElementSource(audioRef.current);
+      sourceNodeRef.current.connect(analyserRef.current);
+      analyserRef.current.connect(audioContextRef.current.destination);
+
+      console.log("✅ Web Audio API initialized successfully");
+      console.log("   - FFT Size:", analyserRef.current.fftSize);
+      console.log("   - Frequency Bin Count:", analyserRef.current.frequencyBinCount);
+      console.log("   - AudioContext state:", audioContextRef.current.state);
+    } catch (error) {
+      console.error("❌ Web Audio API initialization failed:", error);
+    }
   };
 
-  // Simulate progress when playing
-  useEffect(() => {
-    if (playerState === "playing") {
-      const interval = setInterval(() => {
-        setProgress((prev) => (prev < duration ? prev + 1 : 0));
-      }, 1000);
-      return () => clearInterval(interval);
+  // Start frequency visualization
+  const startVisualization = () => {
+    if (!analyserRef.current) {
+      console.warn("⚠️ Analyser not available");
+      return;
     }
-  }, [playerState, duration]);
+
+    const bufferLength = analyserRef.current.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+
+    console.log("🎵 Starting visualization, buffer length:", bufferLength);
+
+    let frameCount = 0;
+
+    const updateFrequencyData = () => {
+      if (!analyserRef.current || playerState !== "playing") return;
+
+      analyserRef.current.getByteFrequencyData(dataArray);
+
+      frameCount++;
+
+      // Debug every 60 frames (~1 second at 60fps)
+      if (frameCount % 60 === 0) {
+        // Log first 20 frequency bins to see what we're getting
+        const sample = Array.from(dataArray.slice(0, 20));
+        console.log("📊 Raw frequency data (first 20 bins):", sample);
+
+        const maxValue = Math.max(...dataArray);
+        const avgValue = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+        console.log(`   Max: ${maxValue}, Avg: ${avgValue.toFixed(1)}`);
+      }
+
+      // Use very specific and distinct frequency ranges
+      const newFrequencyData: number[] = [];
+
+      // Bar 1: Deep Bass (20-60Hz) - bins 1-3
+      let max1 = 0;
+      for (let i = 1; i <= 3; i++) {
+        if (dataArray[i] > max1) max1 = dataArray[i];
+      }
+      newFrequencyData[0] = max1 / 255;
+
+      // Bar 2: Bass (60-250Hz) - bins 4-12
+      let max2 = 0;
+      for (let i = 4; i <= 12; i++) {
+        if (dataArray[i] > max2) max2 = dataArray[i];
+      }
+      newFrequencyData[1] = max2 / 255;
+
+      // Bar 3: Low-Mid (250-500Hz) - bins 13-25
+      let max3 = 0;
+      for (let i = 13; i <= 25; i++) {
+        if (dataArray[i] > max3) max3 = dataArray[i];
+      }
+      newFrequencyData[2] = max3 / 255;
+
+      // Bar 4: Mid (500-2kHz) - bins 26-100
+      let max4 = 0;
+      for (let i = 26; i <= 100; i++) {
+        if (dataArray[i] > max4) max4 = dataArray[i];
+      }
+      newFrequencyData[3] = max4 / 255;
+
+      // Bar 5: High (2kHz-6kHz) - bins 101-300
+      let max5 = 0;
+      for (let i = 101; i <= 300; i++) {
+        if (dataArray[i] > max5) max5 = dataArray[i];
+      }
+      newFrequencyData[4] = max5 / 255;
+
+      // Log calculated values every second
+      if (frameCount % 60 === 0) {
+        console.log("🎚️ Bar values:", newFrequencyData.map((v, i) => `Bar${i + 1}=${v.toFixed(3)}`).join(", "));
+      }
+
+      setFrequencyData(newFrequencyData);
+      animationFrameRef.current = requestAnimationFrame(updateFrequencyData);
+    };
+
+    updateFrequencyData();
+  };
+
+  // Stop frequency visualization
+  const stopVisualization = () => {
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    setFrequencyData([0, 0, 0, 0, 0]);
+  };
+
+  // Handle play/pause
+  const handlePlayPause = async () => {
+    if (!audioRef.current || !currentTrack || playerState === "loading") return;
+
+    console.log("🎮 Play/Pause clicked, current state:", playerState);
+    setPlayerState("loading");
+
+    // Initialize Web Audio API on first play
+    if (!audioContextRef.current) {
+      console.log("🔧 Initializing Web Audio API...");
+      initializeAudioContext();
+    }
+
+    // Resume AudioContext if suspended
+    if (audioContextRef.current?.state === "suspended") {
+      console.log("▶️ Resuming suspended AudioContext...");
+      await audioContextRef.current.resume();
+      console.log("   AudioContext state:", audioContextRef.current.state);
+    }
+
+    try {
+      if (playerState === "playing") {
+        audioRef.current.pause();
+        setPlayerState("paused");
+        stopVisualization();
+        console.log("⏸️ Paused");
+      } else {
+        await audioRef.current.play();
+        setPlayerState("playing");
+        startVisualization();
+        console.log("▶️ Playing, visualization started");
+      }
+    } catch (error) {
+      console.error("❌ Error playing audio:", error);
+      setPlayerState("paused");
+    }
+  };
+
+  // Sync with external play state changes
+  useEffect(() => {
+    if (audioRef.current) {
+      if (playerState === "playing" && audioRef.current.paused) {
+        if (!audioContextRef.current) {
+          initializeAudioContext();
+        }
+        audioRef.current.play().catch(() => setPlayerState("paused"));
+        if (audioContextRef.current?.state === "suspended") {
+          audioContextRef.current.resume();
+        }
+        startVisualization();
+      } else if (playerState === "paused" && !audioRef.current.paused) {
+        audioRef.current.pause();
+        stopVisualization();
+      }
+    }
+  }, [playerState]);
+
+  // Handle seek
+  const handleSeek = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!audioRef.current || !currentTrack) return;
+
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const percentage = x / rect.width;
+    const newTime = percentage * duration;
+
+    audioRef.current.currentTime = newTime;
+    setProgress(newTime);
+  };
 
   // Motion variants for container
   const containerVariants = {
@@ -68,102 +338,80 @@ export function MusicPlayer() {
     },
   };
 
-  // Motion variants for album artwork
-  const artworkVariants = {
-    playing: {
-      scale: 1,
-      rotate: 360,
-      transition: {
-        scale: { duration: 0.3, type: "spring" },
-        rotate: { duration: 20, repeat: Infinity, ease: "linear" },
-      },
-    },
-    paused: {
-      scale: 0.95,
-      rotate: 0,
-      transition: {
-        scale: { duration: 0.3, type: "spring" },
-        rotate: { duration: 0.3 },
-      },
-    },
-    loading: {
-      scale: 0.9,
-      rotate: 0,
-      transition: {
-        scale: { duration: 0.3, type: "spring" },
-        rotate: { duration: 0.3 },
-      },
-    },
-  };
 
   // Equalizer bar component
   const EqualizerBar = ({ index }: { index: number }) => {
-    const barVariants = {
-      playing: {
-        height: ["20%", "100%", "20%"],
-        transition: {
-          duration: 0.5,
-          repeat: Infinity,
-          ease: "easeInOut",
-          delay: index * 0.1,
-        },
-      },
-      paused: {
-        height: "20%",
-        opacity: 1,
-        transition: { duration: 0.3 },
-      },
-      loading: {
-        height: "50%",
-        opacity: 0.5,
-        transition: { duration: 0.3 },
-      },
-    };
+    // Use real frequency data for height animation, scaled by volume
+    let frequencyValue = frequencyData[index] || 0; // Get the frequency value for this bar (0-1)
+    const minHeight = 15; // Minimum height percentage
+    const maxHeight = 85; // Maximum height percentage
+    
+    if (index !== 0){
+      if (frequencyData[index] === frequencyData[0]) {
+        frequencyValue = Math.random() * 0.3; // Small random value to avoid uniformity
+      }
+    }
+    
+    // Calculate height: minHeight + (frequency * range)
+    const barHeight = playerState === "playing"
+      ? minHeight + (frequencyValue * (maxHeight - minHeight))
+      : minHeight;
 
     return (
       <motion.div
-        variants={barVariants}
-        animate={playerState}
-        className="w-3 bg-purple-500 rounded-t-sm"
-        style={{ minHeight: "8px" }}
+        animate={{
+          height: `${barHeight}%`,
+        }}
+        transition={{
+          type: "spring",
+          stiffness: 400,
+          damping: 15,
+          mass: 0.6
+        }}
+        className="w-5 bg-purple-500 rounded-t-sm"
+        style={{ minHeight: "12px" }}
       />
     );
   };
+
+  const displayTitle = currentTrack?.name || "No track selected";
+  const displayArtist = currentTrack ? "Local File" : "Add music to play";
 
   return (
     <motion.div
       variants={containerVariants}
       animate={playerState}
-      className="w-full max-w-[500px] rounded-3xl p-8 shadow-2xl"
+      className="w-full rounded-3xl p-12 shadow-2xl"
     >
       {/* Album Artwork */}
-      <div className="flex items-start gap-6 mb-6">
-        <motion.div
-          variants={artworkVariants}
-          animate={playerState}
-          className="relative w-28 h-28 rounded-2xl bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center shrink-0 overflow-hidden"
+      <div className="flex items-start gap-8 mb-8">
+        <div
+          className="relative w-40 h-40 rounded-3xl bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center shrink-0 overflow-hidden"
         >
-          <Music2 size={40} className="text-gray-900 opacity-70" />
-        </motion.div>
+          <Music2 size={56} className="text-gray-900 opacity-70" />
+        </div>
 
         <div className="flex-1 min-w-0">
-          <h2 className="text-xl font-semibold text-white mb-1 truncate">
-            Awesome Song Title
+          <h2 className="text-3xl font-bold text-white mb-2 truncate">
+            {displayTitle}
           </h2>
-          <p className="text-sm text-gray-400 truncate">Amazing Artist</p>
+          <p className="text-lg text-gray-400 truncate">{displayArtist}</p>
         </div>
       </div>
 
       {/* Equalizer Bars */}
-      <div className="flex items-end justify-start gap-2 h-20 mb-6">
+      <div className="flex items-end justify-start gap-3 h-32 mb-8">
         {[0, 1, 2, 3, 4].map((index) => (
           <EqualizerBar key={index} index={index} />
         ))}
       </div>
 
       {/* Progress Bar */}
-      <div className="mb-4">
-        <div className="relative h-1.5 bg-gray-700 rounded-full overflow-hidden mb-2">
+      <div className="mb-6">
+        <div
+          className="relative h-2 bg-gray-700 rounded-full overflow-hidden mb-3 cursor-pointer"
+          onClick={handleSeek}
+        >
           <motion.div
             className="absolute inset-y-0 left-0 rounded-full"
             style={{
@@ -173,46 +421,50 @@ export function MusicPlayer() {
                   : "#6b7280",
             }}
             initial={{ width: `${(progress / duration) * 100}%` }}
-            animate={{ width: `${(progress / duration) * 100}%` }}
-            transition={{ duration: 0.3 }}
+            animate={{ width: `${(progress / duration) * 100 || 0}%` }}
+            transition={{ duration: 0.1 }}
           />
         </div>
-        <div className="flex justify-between text-xs text-gray-500">
+        <div className="flex justify-between text-sm text-gray-400 font-medium">
           <span>{formatTime(progress)}</span>
           <span>{formatTime(duration)}</span>
         </div>
       </div>
 
       {/* Control Buttons */}
-      <div className="flex items-center justify-center gap-6 mb-6">
+      <div className="flex items-center justify-center gap-8 mb-8">
         <motion.button
           whileHover={{ color: "#ffffff" }}
           className="text-gray-400 transition-colors"
           aria-label="Shuffle"
         >
-          <Shuffle size={20} />
+          <Shuffle size={24} />
         </motion.button>
 
         <motion.button
           whileHover={{ color: "#ffffff" }}
-          className="text-gray-400 transition-colors"
+          onClick={onPrevious}
+          disabled={!onPrevious}
+          className={`transition-colors ${onPrevious ? "text-gray-400" : "text-gray-600 cursor-not-allowed"
+            }`}
           aria-label="Previous"
         >
-          <SkipBack size={24} />
+          <SkipBack size={32} />
         </motion.button>
 
         <motion.button
           whileHover={
-            playerState !== "loading" ? { scale: 1.05 } : undefined
+            playerState !== "loading" && currentTrack ? { scale: 1.05 } : undefined
           }
-          whileTap={playerState !== "loading" ? { scale: 0.95 } : undefined}
+          whileTap={
+            playerState !== "loading" && currentTrack ? { scale: 0.95 } : undefined
+          }
           onClick={handlePlayPause}
-          disabled={playerState === "loading"}
-          className={`w-15 h-15 rounded-full flex items-center justify-center transition-colors ${
-            playerState === "loading"
-              ? "bg-gray-600 cursor-not-allowed"
-              : "bg-purple-600 hover:bg-purple-500"
-          }`}
+          disabled={playerState === "loading" || !currentTrack}
+          className={`w-20 h-20 rounded-full flex items-center justify-center transition-colors ${playerState === "loading" || !currentTrack
+            ? "bg-gray-600 cursor-not-allowed"
+            : "bg-purple-600 hover:bg-purple-500"
+            }`}
           transition={{ type: "spring", stiffness: 400, damping: 17 }}
           aria-label={playerState === "playing" ? "Pause" : "Play"}
         >
@@ -223,9 +475,11 @@ export function MusicPlayer() {
                 initial={{ opacity: 0, rotate: 0 }}
                 animate={{ opacity: 1, rotate: 360 }}
                 exit={{ opacity: 0 }}
-                transition={{ rotate: { duration: 1, repeat: Infinity, ease: "linear" } }}
+                transition={{
+                  rotate: { duration: 1, repeat: Infinity, ease: "linear" },
+                }}
               >
-                <div className="w-15 h-15 p-0 border-3 border-gray-400 border-t-white rounded-full" />
+                <div className="w-8 h-8 border-3 border-gray-400 border-t-white rounded-full" />
               </motion.div>
             ) : playerState === "playing" ? (
               <motion.div
@@ -235,7 +489,7 @@ export function MusicPlayer() {
                 exit={{ opacity: 0, scale: 0.8 }}
                 transition={{ duration: 0.15 }}
               >
-                <Pause size={28} className="text-white" fill="white" />
+                <Pause size={36} className="text-white" fill="white" />
               </motion.div>
             ) : (
               <motion.div
@@ -245,7 +499,7 @@ export function MusicPlayer() {
                 exit={{ opacity: 0, scale: 0.8 }}
                 transition={{ duration: 0.15 }}
               >
-                <Play size={28} className="text-white" fill="white" />
+                <Play size={36} className="text-white ml-1" fill="white" />
               </motion.div>
             )}
           </AnimatePresence>
@@ -253,10 +507,13 @@ export function MusicPlayer() {
 
         <motion.button
           whileHover={{ color: "#ffffff" }}
-          className="text-gray-400 transition-colors"
+          onClick={onNext}
+          disabled={!onNext}
+          className={`transition-colors ${onNext ? "text-gray-400" : "text-gray-600 cursor-not-allowed"
+            }`}
           aria-label="Next"
         >
-          <SkipForward size={24} />
+          <SkipForward size={32} />
         </motion.button>
 
         <motion.button
@@ -264,90 +521,21 @@ export function MusicPlayer() {
           className="text-gray-400 transition-colors"
           aria-label="Repeat"
         >
-          <Repeat size={20} />
+          <Repeat size={24} />
         </motion.button>
       </div>
 
       {/* Volume Control */}
-      <div className="flex items-center gap-3">
-        <Volume2 size={18} className="text-gray-400 shrink-0" />
-        <div className="flex-1 relative">
-          <input
-            type="range"
-            min="0"
-            max="100"
-            value={volume}
-            onChange={(e) => setVolume(Number(e.target.value))}
-            className="w-full h-6 appearance-none bg-transparent cursor-pointer volume-slider"
-            style={
-              {
-                "--volume-width": `${volume}%`,
-              } as React.CSSProperties
-            }
-          />
-        </div>
+      <div className="flex items-center gap-4">
+        <Volume2 size={24} className="text-gray-400 shrink-0" />
+        <Slider
+          value={[volume]}
+          onValueChange={(value) => setVolume(value[0])}
+          max={100}
+          step={1}
+          className="flex-1"
+        />
       </div>
-
-      <style jsx>{`
-        .volume-slider::-webkit-slider-track {
-          width: 100%;
-          height: 6px;
-          background: linear-gradient(
-            to right,
-            #a855f7 0%,
-            #a855f7 var(--volume-width),
-            #374151 var(--volume-width),
-            #374151 100%
-          );
-          border-radius: 9999px;
-        }
-
-        .volume-slider::-webkit-slider-thumb {
-          appearance: none;
-          width: 16px;
-          height: 16px;
-          background: white;
-          border-radius: 50%;
-          cursor: pointer;
-          margin-top: -5px;
-        }
-
-        .volume-slider::-moz-range-track {
-          width: 100%;
-          height: 6px;
-          background: #374151;
-          border-radius: 9999px;
-        }
-
-        .volume-slider::-moz-range-progress {
-          height: 6px;
-          background: #a855f7;
-          border-radius: 9999px;
-        }
-
-        .volume-slider::-moz-range-thumb {
-          width: 16px;
-          height: 16px;
-          background: white;
-          border: none;
-          border-radius: 50%;
-          cursor: pointer;
-        }
-
-        .volume-slider:hover::-webkit-slider-track {
-          background: linear-gradient(
-            to right,
-            #ec4899 0%,
-            #ec4899 var(--volume-width),
-            #374151 var(--volume-width),
-            #374151 100%
-          );
-        }
-
-        .volume-slider:hover::-moz-range-progress {
-          background: #ec4899;
-        }
-      `}</style>
     </motion.div>
   );
 }
